@@ -27,17 +27,13 @@ This application relies entirely on the **Python Standard Library**. You do not 
 ## 🛠️ Installation & Usage
 
 1.  **Download your Data:** Request your "Extended Streaming History" from your Spotify Account Privacy settings. Wait for the email and download the ZIP file.
-2.  **Clone the Repo:**
-    ```bash
-    git clone [https://github.com/yourusername/spotify-history-merger.git](https://github.com/yourusername/spotify-history-merger.git)
-    cd spotify-history-merger
-    ```
-3.  **Run the App:**
+
+2.  **Run the App:**
     ```bash
     python main.py
     ```
     *(Replace `main.py` with whatever you named the script)*
-4.  **Using the GUI:**
+3.  **Using the GUI:**
     * **Step 1:** Click **Select ZIP File** and choose the file you downloaded from Spotify.
     * **Step 2:** Click **Save CSV As...** to choose where to save the results.
     * **Settings:** * *Max tracks:* Limit the output to your top N songs.
