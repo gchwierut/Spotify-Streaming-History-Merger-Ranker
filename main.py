@@ -2,16 +2,18 @@ import json
 import csv
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from collections import defaultdict, deque
 import zipfile
-import re
 import threading
+import datetime
+import re
+import unicodedata
+from functools import cmp_to_key
 
 class HistoryMergerApp:
     def __init__(self, root):
         self.root = root
-        root.title("Merge Streaming Histories to CSV")
-        root.geometry("600x650")
+        root.title("Spotify Streaming History Merger/Ranker")
+        root.geometry("650x900")
 
         self.zip_path = None
         self.output_path = None
@@ -19,452 +21,399 @@ class HistoryMergerApp:
         self.stop_event = threading.Event()
         self.final_uris = []
 
-        self.re_parens = re.compile(r'\s*[\(\[].*?[\)\]]')
-        self.re_dash = re.compile(r'\s+[-–—]\s+')
-        self.re_live = re.compile(r'\b(live|concert|ao vivo)\b', re.IGNORECASE)
-        self.re_bad_brackets = re.compile(r'[\(\[]')
-        self.re_bad_dash = re.compile(r'\s[-–—]|\s[-–—]\s')
-
+        # --- UI Setup ---
         main_frame = tk.Frame(root, padx=15, pady=15)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
         frame_top = tk.Frame(main_frame)
         frame_top.pack(fill=tk.X, pady=5)
-        self.add_button = tk.Button(frame_top, text="1. Select ZIP File", command=self.select_zip, width=20)
-        self.add_button.pack(side=tk.LEFT, padx=5)
-        self.file_label = tk.Label(frame_top, text="No file selected", fg="gray", anchor="w")
-        self.file_label.pack(side=tk.LEFT, padx=5, fill=tk.X)
+        tk.Button(frame_top, text="1. Select ZIP File", command=self.select_zip, width=20).pack(side=tk.LEFT, padx=5)
+        self.label_zip = tk.Label(frame_top, text="No file selected", anchor="w", fg="gray")
+        self.label_zip.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         frame_mid = tk.Frame(main_frame)
         frame_mid.pack(fill=tk.X, pady=5)
-        self.output_button = tk.Button(frame_mid, text="2. Save CSV As...", command=self.choose_output, width=20)
-        self.output_button.pack(side=tk.LEFT, padx=5)
-        self.out_label = tk.Label(frame_mid, text="No output selected", fg="gray", anchor="w")
-        self.out_label.pack(side=tk.LEFT, padx=5, fill=tk.X)
+        tk.Button(frame_mid, text="2. Save CSV As...", command=self.select_output, width=20).pack(side=tk.LEFT, padx=5)
+        self.label_out = tk.Label(frame_mid, text="No file selected", anchor="w", fg="gray")
+        self.label_out.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        filter_frame = tk.LabelFrame(main_frame, text="Settings", padx=15, pady=10)
-        filter_frame.pack(fill=tk.X, pady=15)
-        row1 = tk.Frame(filter_frame)
-        row1.pack(fill=tk.X, pady=2)
-        tk.Label(row1, text="Max tracks in result:", width=20, anchor="w").pack(side=tk.LEFT)
-        self.max_tracks_var = tk.StringVar(value="10000")
-        tk.Entry(row1, textvariable=self.max_tracks_var, width=10).pack(side=tk.LEFT)
-        row2 = tk.Frame(filter_frame)
-        row2.pack(fill=tk.X, pady=5)
-        self.dedup_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(row2, text="Ignore duplicate entries", variable=self.dedup_var).pack(side=tk.LEFT)
+        frame_algo = tk.LabelFrame(main_frame, text="Wrapped Settings", padx=10, pady=10)
+        frame_algo.pack(fill=tk.X, pady=15)
 
-        self.run_button = tk.Button(main_frame, text="3. Process History", command=self.toggle_processing, state=tk.DISABLED, bg="#dddddd", height=2, font=("Arial", 10, "bold"))
-        self.run_button.pack(pady=5, fill=tk.X)
+        tk.Label(frame_algo, text="Target Year:").pack(anchor="w")
+        self.entry_year = tk.Entry(frame_algo, width=8)
+        self.entry_year.insert(0, "2025")
+        self.entry_year.pack(pady=2)
+
+        tk.Label(frame_algo, text="Recency Weight:").pack(anchor="w")
+        self.val_recency = tk.DoubleVar(value=0.25)
+        tk.Scale(frame_algo, from_=0.0, to=1.0, resolution=0.05, orient=tk.HORIZONTAL, variable=self.val_recency).pack(fill=tk.X)
+
+        tk.Label(frame_algo, text="Time Weight:").pack(anchor="w")
+        self.val_time = tk.DoubleVar(value=0.005)
+        tk.Scale(frame_algo, from_=0.0, to=0.02, resolution=0.001, orient=tk.HORIZONTAL, variable=self.val_time).pack(fill=tk.X)
+
+        tk.Label(frame_algo, text="Min Duration (ms):").pack(anchor="w")
+        self.entry_ms = tk.Entry(frame_algo, width=8)
+        self.entry_ms.insert(0, "30000")
+        self.entry_ms.pack(pady=5)
+
         self.progress_var = tk.DoubleVar()
-        self.progress = ttk.Progressbar(main_frame, variable=self.progress_var, maximum=100)
-        self.progress.pack(pady=5, fill=tk.X)
-        self.status_label = tk.Label(main_frame, text="Ready")
-        self.status_label.pack(pady=5)
+        self.progress_bar = ttk.Progressbar(main_frame, variable=self.progress_var, maximum=100)
+        self.progress_bar.pack(fill=tk.X, pady=15)
+        self.status_label = tk.Label(main_frame, text="Ready", fg="blue")
+        self.status_label.pack(anchor="w")
 
-        self.copy_button = tk.Button(main_frame, text="4. Copy URIs to Clipboard", command=self.copy_uris, state=tk.DISABLED, bg="#dddddd", height=2)
-        self.copy_button.pack(pady=10, fill=tk.X)
+        self.run_button = tk.Button(main_frame, text="GENERATE SEQUENCE", command=self.run_process,
+                                    bg="#4CAF50", fg="white", font=("Arial", 10, "bold"), state=tk.DISABLED)
+        self.run_button.pack(fill=tk.X, pady=5)
+
+        self.copy_button = tk.Button(main_frame, text="Copy URIs to Clipboard", command=self.copy_to_clipboard,
+                                     bg="#dddddd", fg="black", state=tk.DISABLED)
+        self.copy_button.pack(fill=tk.X, pady=5)
 
     def select_zip(self):
         path = filedialog.askopenfilename(filetypes=[("ZIP files", "*.zip")])
         if path:
             self.zip_path = path
-            self.file_label.config(text=path.split('/')[-1], fg="black")
-            self.update_state()
+            self.label_zip.config(text=path, fg="black")
+            if self.output_path:
+                self.run_button.config(state=tk.NORMAL)
 
-    def choose_output(self):
-        out = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files", "*.csv")])
-        if out:
-            self.output_path = out
-            self.out_label.config(text=out.split('/')[-1], fg="black")
-            self.update_state()
-
-    def update_state(self):
-        if self.zip_path and self.output_path and not self.is_running:
-            self.run_button.config(state=tk.NORMAL, bg="#4CAF50", fg="white", text="3. Process History")
-        elif self.is_running:
-            self.run_button.config(state=tk.NORMAL, bg="#f44336", fg="white", text="STOP / CANCEL")
-        else:
-            self.run_button.config(state=tk.DISABLED, bg="#dddddd")
-
-    def toggle_processing(self):
-        if not self.is_running:
-            self.is_running = True
-            self.stop_event.clear()
-            self.update_state()
-            self.copy_button.config(state=tk.DISABLED, bg="#dddddd")
-            self.status_label.config(text="Initializing...")
-            self.progress_var.set(0)
-            threading.Thread(target=self.run_process, daemon=True).start()
-        else:
-            self.stop_event.set()
-            self.status_label.config(text="Stopping... Please wait.")
-            self.run_button.config(state=tk.DISABLED)
-
-    def copy_uris(self):
-        if not self.final_uris:
-            messagebox.showinfo("Info", "No URIs available to copy.")
-            return
-        try:
-            self.root.clipboard_clear()
-            text_to_copy = "\n".join(self.final_uris)
-            self.root.clipboard_append(text_to_copy)
-            self.root.update()
-            messagebox.showinfo("Copied", f"Successfully copied {len(self.final_uris)} URIs to clipboard!")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to copy to clipboard: {str(e)}")
-
-    # --- LOGIC ---
-    def normalize_track_name(self, track_name):
-        if not track_name: return track_name
-        normalized = track_name
-        normalized = self.re_parens.sub('', normalized)
-        normalized = normalized.split(',')[0]
-        normalized = self.re_dash.split(normalized)[0]
-        return normalized.strip().lower()
-
-    def has_suffix_or_bad_chars(self, track_name):
-        if not track_name: return False
-        if self.re_bad_brackets.search(track_name): return True
-        if ',' in track_name: return True
-        if self.re_bad_dash.search(track_name): return True
-        return False
-
-    def is_live_version(self, track_name):
-        if not track_name: return False
-        return bool(self.re_live.search(track_name))
-
-    def get_preferred_track_name(self, name1, name2):
-        if not name1: return name2
-        if not name2: return name1
-        bad_1 = self.has_suffix_or_bad_chars(name1)
-        bad_2 = self.has_suffix_or_bad_chars(name2)
-        if not bad_1 and bad_2: return name1
-        elif bad_1 and not bad_2: return name2
-        is_live_1 = self.is_live_version(name1)
-        is_live_2 = self.is_live_version(name2)
-        if not is_live_1 and is_live_2: return name1
-        elif is_live_1 and not is_live_2: return name2
-        return name1 if len(name1) <= len(name2) else name2
-
-    def extract_year(self, timestamp):
-        if not timestamp: return 0
-        try: return int(timestamp[:4])
-        except: return 0
-
-    def get_sorted_alternative_years(self, track_info, current_year):
-        yc = track_info.get('raw_year_counts', {})
-        candidates = []
-        for y, count in yc.items():
-            if y == current_year: continue
-            if count > 0:
-                candidates.append(y)
-        candidates.sort(key=lambda y: yc[y], reverse=True)
-        return candidates
-
-    def try_insert_sorted_strict(self, main_list, track, spacing=6):
-        """
-        RIGOROUS insertion check.
-        Checks if insertion at 'i' maintains spacing for:
-        1. The new track relative to its Left Neighbors.
-        2. The new track relative to its Right Neighbors (who will shift +1).
-        3. Existing conflicts? No, existing list is assumed valid.
-           But we must ensure we don't push a Right Neighbor closer to a Right-Right Neighbor?
-           Wait, insertion only increases distance between Left and Right neighbors.
-           So we ONLY need to check the New Track against Left and Right.
-        """
-        track_score = (-track.get('peak_year_count', 0), -track.get('listen_count', 0))
-
-        artist = track.get('master_metadata_album_artist_name')
-        album = track.get('master_metadata_album_album_name')
-
-        # 1. Find Ideal Index
-        ideal_idx = len(main_list)
-        for i, entry in enumerate(main_list):
-            entry_score = (-entry.get('peak_year_count', 0), -entry.get('listen_count', 0))
-            if track_score < entry_score:
-                ideal_idx = i
-                break
-
-        # 2. Find conflict indices in CURRENT list
-        conflict_indices = []
-        for i, t in enumerate(main_list):
-            if (t.get('master_metadata_album_artist_name') == artist) or \
-               (t.get('master_metadata_album_album_name') == album):
-                conflict_indices.append(i)
-
-        # 3. Scan for valid spot
-        # We start at ideal_idx. If we can't fit there, we look further down.
-        # This naturally "demotes" the track if it conflicts, preserving rank for others.
-
-        for i in range(ideal_idx, len(main_list) + 1):
-            valid = True
-
-            # Check Left Neighbors (Indices < i)
-            # Find closest conflict to the left
-            # We want max(idx) where idx < i
-            left_conflict = -9999
-            for idx in conflict_indices:
-                if idx < i:
-                    left_conflict = idx
-                else:
-                    break # conflict_indices is sorted if we appended strictly?
-                          # Yes, because we scan main_list linearly.
-
-            # Distance check: i - left_conflict >= spacing
-            if (i - left_conflict) < spacing:
-                valid = False
-
-            # Check Right Neighbors (Indices >= i)
-            # These will shift to idx+1.
-            # So the new track is at i. The conflict is at old_idx, which becomes old_idx+1.
-            # Distance = (old_idx + 1) - i = old_idx - i + 1.
-
-            if valid:
-                for idx in conflict_indices:
-                    if idx >= i:
-                        # This is the closest right conflict
-                        dist = idx - i + 1
-                        if dist < spacing:
-                            valid = False
-                        break # Only need the closest one
-
-            if valid:
-                main_list.insert(i, track)
-                return True
-
-        return False
+    def select_output(self):
+        path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files", "*.csv")])
+        if path:
+            self.output_path = path
+            self.label_out.config(text=path, fg="black")
+            if self.zip_path:
+                self.run_button.config(state=tk.NORMAL)
 
     def run_process(self):
+        if self.is_running:
+            return
+        self.is_running, self.final_uris = True, []
+        threading.Thread(target=self.process_files, daemon=True).start()
+
+    def copy_to_clipboard(self):
+        if not self.final_uris:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append("\n".join(self.final_uris))
+        messagebox.showinfo("Copied", f"Copied {len(self.final_uris)} URIs!")
+
+    def normalize_string(self, s):
+        if not s: return ""
+        s = unicodedata.normalize('NFKD', s).lower()
+        parts = re.split(r'[-(\[]', s, maxsplit=1)
+        s = parts[0]
+        s = re.sub(r'[^\w\s]', '', s)
+        return re.sub(r'\s+', ' ', s).strip()
+
+    def process_files(self):
         try:
-            try:
-                max_tracks = int(self.max_tracks_var.get())
-                if max_tracks < 1: max_tracks = 10000
-            except ValueError:
-                self.finish_gui("Error", "Numeric fields must contain valid numbers", error=True)
-                return
+            min_ms = int(self.entry_ms.get())
+            raw_plays = []
 
-            dedup_enabled = self.dedup_var.get()
-            self.final_uris = []
+            # --- PASS 1: READ ---
+            with zipfile.ZipFile(self.zip_path, 'r') as z:
+                files = sorted([n for n in z.namelist() if n.endswith('.json')])
+                total_files = len(files) or 1
+                for i, filename in enumerate(files):
+                    self.update_progress((i / total_files) * 30, f"Reading {filename}...")
+                    with z.open(filename) as f:
+                        data = json.load(f)
+                        if isinstance(data, dict):
+                            data = data.get('items', [])
+                        for item in data:
+                            if item.get('incognito_mode'): continue
 
-            track_data = defaultdict(lambda: {
-                'count': 0, 'total_ms_played': 0, 'year_counts': defaultdict(int),
-                'raw_year_counts': defaultdict(int),
-                'first_ts': None, 'last_ts': None,
-                'preferred_track_name': None,
-                'preferred_metadata_entry': None, 'preferred_artist_name': None
-            })
+                            uri = item.get('spotify_track_uri') or item.get('uri')
+                            ms = item.get('ms_played') if item.get('ms_played') is not None else item.get('msPlayed', 0)
+                            if not uri or ms < min_ms: continue
 
-            seen_entries = set()
-            all_fieldnames = set()
-            processed_files = 0
+                            ts_str = item.get('ts') or item.get('endTime')
+                            dt = None
+                            for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M"):
+                                try:
+                                    dt = datetime.datetime.strptime(ts_str, fmt).replace(tzinfo=datetime.timezone.utc)
+                                    break
+                                except Exception: continue
+                            if not dt: continue
 
-            skipped_count = 0
-            incognito_count = 0
-            dup_count = 0
-            sleep_count = 0
-            spacing_rejects = 0
+                            name = item.get('master_metadata_track_name') or item.get('trackName')
+                            artist = item.get('master_metadata_album_artist_name') or item.get('artistName')
+                            album = item.get('master_metadata_album_album_name') or item.get('albumName')
 
-            with zipfile.ZipFile(self.zip_path, 'r') as zf:
-                all_files = zf.namelist()
-                target_files = [n for n in all_files if n.split('/')[-1].startswith("Streaming_History_Audio_") and n.endswith(".json")]
-                total_files = len(target_files)
+                            if not name or not artist: continue
+                            if album and "sleep" in album.lower() and "max richter" in artist.lower(): continue
 
-                if total_files == 0:
-                    self.finish_gui("Error", "No Streaming_History_Audio files found in ZIP", error=True)
-                    return
+                            raw_plays.append({
+                                "dt": dt,
+                                "uri": uri,
+                                "name": name,
+                                "artist": artist,
+                                "album": album,
+                                "ms": ms,
+                                "shuffle": item.get('shuffle', False)
+                            })
 
-                for name in target_files:
-                    if self.stop_event.is_set():
-                        self.finish_gui("Cancelled", "Processing cancelled.", error=False)
-                        return
+            # --- PASS 2: SESSIONS & INDEXING ---
+            self.update_progress(40, "Building Sessions & Indexing...")
+            raw_plays.sort(key=lambda x: x["dt"])
 
-                    try:
-                        with zf.open(name) as f:
-                            data = json.loads(f.read().decode('utf-8-sig'))
+            track_map = {}
+            SESSION_TIMEOUT_SEC = 1200 # 20 mins
 
-                        history = data.get("items") or data.get("history") or [] if isinstance(data, dict) else data if isinstance(data, list) else []
+            current_session_id = 0
+            current_session_index = 0
+            last_ts_val = 0
 
-                        for entry in history:
-                            if isinstance(entry, dict):
-                                # DEDUPLICATION (Always ON)
-                                ts = entry.get("ts")
-                                if not ts: continue
-                                uid = entry.get("spotify_track_uri") or (entry.get("master_metadata_track_name") or "") + (entry.get("master_metadata_album_artist_name") or "")
-                                unique_key = (ts, uid)
+            session_history = {}
 
-                                if unique_key in seen_entries:
-                                    dup_count += 1
-                                    continue
-                                seen_entries.add(unique_key)
+            for play in raw_plays:
+                ts_val = play["dt"].timestamp()
 
-                                if entry.get("skipped") in (True, "True", "true"):
-                                    skipped_count += 1
-                                    continue
-                                if entry.get("incognito_mode") in (True, "True", "true"):
-                                    incognito_count += 1
-                                    continue
+                if (ts_val - last_ts_val) > SESSION_TIMEOUT_SEC:
+                    current_session_id += 1
+                    current_session_index = 0
 
-                                all_fieldnames.update(entry.keys())
-                                artist = entry.get("master_metadata_album_artist_name")
-                                track_raw = entry.get("master_metadata_track_name")
-                                if not track_raw: continue
+                key = f"{self.normalize_string(play['name'])}|{self.normalize_string(play['artist'])}"
+                if key not in track_map:
+                    track_map[key] = {
+                        "main_uri": play["uri"],
+                        "name": play["name"],
+                        "artist": play["artist"],
+                        "album": play["album"],
+                        "year_stats": {},
+                        "uri_counts": {},
+                        "total_plays": 0,
+                        "raw_key": key
+                    }
 
-                                artist_clean = artist.strip() if artist else ""
-                                track_norm = self.normalize_track_name(track_raw)
-                                year = self.extract_year(entry.get("ts"))
-                                key = (artist_clean.lower(), track_norm)
+                m = track_map[key]
+                m["total_plays"] += 1
+                m["uri_counts"][play["uri"]] = m["uri_counts"].get(play["uri"], 0) + 1
 
-                                info = track_data[key]
-                                info['count'] += 1
-                                info['year_counts'][year] += 1
-                                info['raw_year_counts'][year] += 1
-                                info['total_ms_played'] += entry.get("ms_played", 0)
+                if m["uri_counts"][play["uri"]] >= m["uri_counts"].get(m["main_uri"], 0):
+                    m["main_uri"] = play["uri"]
+                    m["name"] = play["name"]
+                    m["artist"] = play["artist"]
+                    m["album"] = play["album"]
 
-                                ts = entry.get("ts")
-                                if ts:
-                                    if not info['first_ts'] or ts < info['first_ts']: info['first_ts'] = ts
-                                    if not info['last_ts'] or ts > info['last_ts']: info['last_ts'] = ts
+                y = play["dt"].year
+                if y not in m["year_stats"]:
+                    m["year_stats"][y] = {
+                        "plays": 0, "ms": 0, "last_ts": 0.0
+                    }
 
-                                curr_pref = info['preferred_track_name']
-                                chosen = self.get_preferred_track_name(curr_pref, track_raw)
-                                info['preferred_track_name'] = chosen
-                                if not info['preferred_artist_name']: info['preferred_artist_name'] = artist_clean
-                                if curr_pref is None or chosen == track_raw:
-                                    info['preferred_metadata_entry'] = entry.copy()
+                ys = m["year_stats"][y]
+                ys["plays"] += 1
+                ys["ms"] += play["ms"]
+                if ts_val > ys["last_ts"]:
+                    ys["last_ts"] = ts_val
 
-                        processed_files += 1
-                        self.update_progress((processed_files / total_files) * 50, f"Reading file {processed_files}/{total_files}...")
+                # --- SESSION RECORDING (Only Non-Shuffle) ---
+                if not play["shuffle"]:
+                    if key not in session_history:
+                        session_history[key] = {}
+                    if current_session_id not in session_history[key]:
+                        session_history[key][current_session_id] = current_session_index
 
-                    except Exception as e:
-                        print(f"Skipped file {name}: {e}")
+                current_session_index += 1
+                last_ts_val = ts_val
+
+            # --- COMPARATOR (Shared Sessions Only) ---
+            def compare_tracks(t1, t2):
+                k1 = t1["_raw_key"]
+                k2 = t2["_raw_key"]
+
+                hist1 = session_history.get(k1, {})
+                hist2 = session_history.get(k2, {})
+
+                common_sessions = set(hist1.keys()) & set(hist2.keys())
+
+                if not common_sessions:
+                    return 0
+
+                t1_wins = 0
+                t2_wins = 0
+
+                for sid in common_sessions:
+                    idx1 = hist1[sid]
+                    idx2 = hist2[sid]
+                    if idx1 < idx2:
+                        t1_wins += 1
+                    elif idx2 < idx1:
+                        t2_wins += 1
+
+                return t2_wins - t1_wins
+
+            # --- HELPER: Process a block of same-artist tracks ---
+            def process_artist_block(block):
+                if not block: return []
+
+                # 1. Score Albums (Max Score)
+                album_max_scores = {}
+                for t in block:
+                    alb = t.get("Album Name", "")
+                    if alb not in album_max_scores: album_max_scores[alb] = 0
+                    if t["_score"] > album_max_scores[alb]: album_max_scores[alb] = t["_score"]
+
+                # 2. Sort by Album Score then Name
+                block.sort(key=lambda t: (
+                    -album_max_scores.get(t.get("Album Name", ""), 0),
+                    t.get("Album Name", "")
+                ))
+
+                # 3. Sort internally by Session History
+                current_album_start = 0
+                for k in range(len(block)):
+                    is_last = (k == len(block) - 1)
+                    if is_last or block[k].get("Album Name") != block[k+1].get("Album Name"):
+                        album_slice = block[current_album_start : k+1]
+                        if len(album_slice) > 1:
+                            # Strict shared-session sort only within album
+                            album_slice.sort(key=cmp_to_key(compare_tracks))
+
+                        block[current_album_start : k+1] = album_slice
+                        current_album_start = k + 1
+                return block
+
+            # --- PASS 3: SCORING & FINAL SORT ---
+            self.update_progress(60, "Calculations...")
+            all_unique_tracks = [v for v in track_map.values() if v["total_plays"] > 1]
+            all_unique_tracks.sort(key=lambda x: x["total_plays"], reverse=True)
+            top_11000 = all_unique_tracks[:11000]
+
+            rec_w = self.val_recency.get() * 10000.0
+            time_w = self.val_time.get() * 10000.0
+
+            year_buckets = {}
+            for d in top_11000:
+                home_year = max(d["year_stats"].keys(), key=lambda yy: d["year_stats"][yy]["plays"])
+                ys = d["year_stats"][home_year]
+                y_start = datetime.datetime(home_year, 1, 1, tzinfo=datetime.timezone.utc).timestamp()
+
+                score = (
+                    ys["plays"] * 10000.0
+                    + max(0.0, (ys["last_ts"] - y_start) / 86400.0) * rec_w
+                    + (ys["ms"] / 60000.0) * time_w
+                )
+
+                if home_year not in year_buckets:
+                    year_buckets[home_year] = []
+
+                year_buckets[home_year].append({
+                    "Track URI": d["main_uri"],
+                    "Track Name": d["name"],
+                    "Artist Name(s)": d["artist"],
+                    "Album Name": d["album"],
+                    "Year": home_year,
+                    "Total Plays": d["total_plays"],
+                    "_score": score,
+                    "_raw_key": d["raw_key"]
+                })
+
+            final_list = []
+            sorted_years = sorted(year_buckets.keys(), reverse=True)
+
+            self.update_progress(80, "Applying Smart Cluster Fix...")
+
+            for y in sorted_years:
+                year_block = year_buckets[y]
+                # 1. Base Sort: Score Descending
+                year_block.sort(key=lambda x: -x["_score"])
+
+                # 2. DISRUPTION FIXER LOOP
+                i = 0
+                while i < len(year_block) - 2:
+                    curr_track = year_block[i]
+                    intruder = year_block[i+1]
+                    reunion = year_block[i+2]
+
+                    curr_artist = curr_track.get("Artist Name(s)")
+                    intruder_artist = intruder.get("Artist Name(s)")
+                    reunion_artist = reunion.get("Artist Name(s)")
+
+                    # Check pattern: A -> B -> A
+                    if (curr_artist == reunion_artist) and (curr_artist != intruder_artist):
+                        # FIX: Pull the Reunion track up
+                        track_to_move = year_block.pop(i+2)
+                        year_block.insert(i+1, track_to_move)
+
+                        # --- CLUSTER RE-SORT LOGIC ---
+                        # 1. Identify the full Artist Block built so far
+                        block_start = i
+                        while block_start > 0 and year_block[block_start-1].get("Artist Name(s)") == curr_artist:
+                            block_start -= 1
+
+                        block_end = i + 2
+                        while block_end < len(year_block) and year_block[block_end].get("Artist Name(s)") == curr_artist:
+                            block_end += 1
+
+                        sub_block = year_block[block_start : block_end]
+
+                        # Use the helper function to sort this specific cluster correctly (Album -> Session)
+                        sorted_sub_block = process_artist_block(sub_block)
+
+                        # Apply sorted cluster back to main list
+                        year_block[block_start : block_end] = sorted_sub_block
+
+                        # Continue loop without incrementing 'i' to catch chained disruptions
                         continue
 
-            if self.stop_event.is_set(): return
+                    i += 1
 
-            self.update_progress(60, "Consolidating Tracks...")
+                # 3. Final Polish for existing contiguous blocks (ones that weren't "broken")
+                # This ensures consistent sorting logic across the entire file
+                grouped_list = []
+                current_artist_block = []
+                last_artist = None
 
-            all_tracks_list = []
-            for info in track_data.values():
-                best = info['preferred_metadata_entry']
-                if info['preferred_artist_name'].lower() == 'max richter' and best.get('master_metadata_album_album_name') == 'Sleep':
-                    sleep_count += 1
-                    continue
+                for track in year_block:
+                    curr_artist = track.get("Artist Name(s)")
 
-                yc = info['year_counts']
-                peak_year = max(yc.keys(), key=lambda y: (yc[y], y)) if yc else 0
+                    if last_artist is not None and curr_artist != last_artist:
+                        grouped_list.extend(process_artist_block(current_artist_block))
+                        current_artist_block = []
 
-                row = best.copy()
-                row.update({
-                    'master_metadata_track_name': info['preferred_track_name'],
-                    'master_metadata_album_artist_name': info['preferred_artist_name'],
-                    'master_metadata_album_album_name': best.get('master_metadata_album_album_name'), # Explicitly ensure album
-                    'listen_count': info['count'],
-                    'peak_year': peak_year,
-                    'peak_year_count': yc[peak_year],
-                    'total_ms_played': info['total_ms_played'],
-                    'first_listen_ts': info['first_ts'],
-                    'last_listen_ts': info['last_ts'],
-                    'raw_year_counts': info['raw_year_counts']
-                })
-                all_tracks_list.append(row)
+                    current_artist_block.append(track)
+                    last_artist = curr_artist
 
-            # SORT GLOBALLY BY LISTEN COUNT
-            all_tracks_list.sort(key=lambda x: -x['listen_count'])
+                if current_artist_block:
+                    grouped_list.extend(process_artist_block(current_artist_block))
 
-            self.update_progress(70, "Processing & Filling Quota...")
+                final_list.extend(grouped_list)
 
-            # --- INFINITE FILL LOOP ---
-            finalized_years = defaultdict(list)
-            accepted_total = 0
-
-            for track in all_tracks_list:
-                if accepted_total >= max_tracks:
-                    break
-
-                # 1. Try Peak Year
-                peak = track['peak_year']
-                if self.try_insert_sorted_strict(finalized_years[peak], track, spacing=6):
-                    accepted_total += 1
-                    continue
-
-                # 2. Try Alternative Years
-                alts = self.get_sorted_alternative_years(track, peak)
-                placed = False
-                for alt_year in alts:
-                    track['peak_year'] = alt_year
-                    track['peak_year_count'] = track['raw_year_counts'][alt_year]
-
-                    if self.try_insert_sorted_strict(finalized_years[alt_year], track, spacing=6):
-                        accepted_total += 1
-                        placed = True
-                        break
-
-                if not placed:
-                    spacing_rejects += 1
-
-            # Flatten results
-            final_rows = []
-            for y in sorted(finalized_years.keys(), reverse=True):
-                final_rows.extend(finalized_years[y])
-
-            # Store URIs
-            self.final_uris = [row.get('spotify_track_uri', '') for row in final_rows if row.get('spotify_track_uri')]
-
-            self.update_progress(90, "Writing CSV...")
-
-            prio = ['peak_year', 'peak_year_count', 'listen_count', 'master_metadata_track_name',
-                    'master_metadata_album_artist_name', 'master_metadata_album_album_name',
-                    'total_ms_played', 'first_listen_ts', 'last_listen_ts', 'spotify_track_uri']
-            fields = prio + sorted([f for f in all_fieldnames if f not in prio and f not in ['ms_played', 'ts']])
+            self.final_uris = [t["Track URI"] for t in final_list]
 
             with open(self.output_path, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=[
+                        "Track URI", "Track Name", "Artist Name(s)",
+                        "Album Name", "Year", "Total Plays", "Score"
+                    ],
+                    extrasaction='ignore'
+                )
                 writer.writeheader()
-                writer.writerows(final_rows)
+                for r in final_list:
+                    r["Score"] = f"{r['_score']:.2f}"
+                    writer.writerow(r)
 
-            self.update_progress(100, "Done!")
-
-            stats_msg = f"Success! Created {len(final_rows)} tracks."
-            details = []
-            if skipped_count: details.append(f"Skipped (Flag): {skipped_count}")
-            if incognito_count: details.append(f"Incognito Mode: {incognito_count}")
-            if dup_count: details.append(f"Duplicates Removed: {dup_count}")
-            if sleep_count: details.append(f"Sleep Filtered: {sleep_count}")
-            if spacing_rejects: details.append(f"Spacing Conflicts Skipped: {spacing_rejects}")
-            details.append(f"Total Reviewed: {accepted_total + spacing_rejects}")
-
-            if details:
-                stats_msg += "\n\nStats:\n" + "\n".join(details)
-
-            self.finish_gui("Done", stats_msg, error=False)
-
+            self.finish_gui("Success", f"Saved {len(final_list)} tracks.", False)
         except Exception as e:
-            self.finish_gui("Error", str(e), error=True)
+            self.finish_gui("Error", str(e), True)
 
     def update_progress(self, val, text):
-        def _update():
-            self.progress_var.set(val)
-            self.status_label.config(text=text)
-        self.root.after(0, _update)
+        self.root.after(0, lambda: (self.progress_var.set(val), self.status_label.config(text=text)))
 
-    def finish_gui(self, title, message, error=False):
-        def _update():
+    def finish_gui(self, title, msg, err):
+        def _u():
             self.is_running = False
-            self.progress_var.set(0)
-            self.update_state()
-            self.status_label.config(text=title)
-
-            if not error and self.final_uris:
-                self.copy_button.config(state=tk.NORMAL, bg="#2196F3", fg="white")
-            else:
-                self.copy_button.config(state=tk.DISABLED, bg="#dddddd", fg="black")
-
-            if error:
-                messagebox.showerror(title, message)
-            else:
-                messagebox.showinfo(title, message)
-        self.root.after(0, _update)
+            self.copy_button.config(state=tk.NORMAL if not err else tk.DISABLED)
+            messagebox.showinfo(title, msg)
+        self.root.after(0, _u)
 
 if __name__ == "__main__":
     root = tk.Tk()
